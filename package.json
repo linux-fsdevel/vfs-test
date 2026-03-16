@@ -1,0 +1,11 @@
+{
+  "name": "vfs-workflows",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bridge": "node scripts/ml2pr.mjs"
+  },
+  "dependencies": {
+    "@octokit/rest": "^21.0.0"
+  }
+}
