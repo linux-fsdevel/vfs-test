@@ -43,7 +43,7 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/kdave/xfstests.git "$MKOSI_FSTESTS"
           if [ "${{ inputs.test_suite }}" = "ovl-fstests" ]; then
-            git clone --depth=1 https://github.com/amir73il/unionmount-testsuite.git "$MKOSI_FSTESTS/unionmount-testsuite"
+            git clone --depth=1 https://github.com/amir73il/unionmount-testsuite.git "$MKOSI_FSTESTS/src/unionmount-testsuite"
           fi
 
       - name: Configure mkosi
