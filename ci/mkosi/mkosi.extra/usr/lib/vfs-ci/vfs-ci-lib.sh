@@ -25,5 +25,15 @@ case "$ID" in
         ;;
 esac
 
-XFS_EXCLUDE+=" -e xfs/017 -e xfs/018 -e xfs/176 -e xfs/556 -e xfs/620"
-OVL_EXCLUDE+=" -e generic/091 -e generic/103 -e generic/263 -e generic/760 ${XFS_EXCLUDE}"
+# xfs/008: unreliable - "holes has value of 44 holes is NOT in range 45 .. 55"
+XFS_EXCLUDE+=" -e xfs/008 \
+ -e xfs/017 \
+ -e xfs/018 \
+ -e xfs/176 \
+ -e xfs/556 \
+ -e xfs/620"
+OVL_EXCLUDE+=" -e generic/091 \
+ -e generic/103 \
+ -e generic/263 \
+ -e generic/760 \
+ ${XFS_EXCLUDE}"
