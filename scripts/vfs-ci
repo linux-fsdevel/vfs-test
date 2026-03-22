@@ -3,8 +3,8 @@
 vfs-ci - Manage CI for linux-fsdevel/vfs
 
 Standalone tool for managing the VFS CI infrastructure. Provides
-commands to sync CI files, run the mailing-list-to-PR bridge, rerun
-or cancel CI runs, and clean up branches.
+commands to sync CI files, run the mailing-list-to-PR bridge,
+cancel CI runs, and clean up branches.
 
 Designed to be self-contained with no external dependencies beyond
 the gh CLI tool.
@@ -12,9 +12,12 @@ the gh CLI tool.
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 # ── ANSI colors ──────────────────────────────────────────────────────
 
@@ -56,15 +59,43 @@ VMTEST_REPO = "linux-fsdevel/vfs-test"
 VFS_REPO = "linux-fsdevel/vfs"
 POLL_INTERVAL = 10
 POLL_TIMEOUT = 600
+VFS_TEST = Path(__file__).resolve().parent.parent
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
-def gh(*args, check=True, capture=False, quiet=False):
+def parse_pr_range(value):
+    """Parse a PR number or range (e.g. '235' or '235-240')."""
+    if "-" in value:
+        parts = value.split("-", 1)
+        try:
+            start, end = int(parts[0]), int(parts[1])
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid range: {value}")
+        if start > end:
+            raise argparse.ArgumentTypeError(f"invalid range: {value}")
+        return list(range(start, end + 1))
+    try:
+        return [int(value)]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid PR number: {value}")
+
+
+def expand_prs(raw):
+    """Flatten a list of parse_pr_range results into unique PR numbers."""
+    seen = set()
+    result = []
+    for item in raw:
+        for n in item:
+            if n not in seen:
+                seen.add(n)
+                result.append(n)
+    return result
+
+
+def gh(*args, check=True, capture=False):
     """Run a gh CLI command."""
     cmd = ["gh"] + list(args)
-    if quiet:
-        return subprocess.run(cmd, capture_output=True, text=True, check=check)
     if capture:
         return subprocess.run(cmd, capture_output=True, text=True, check=check)
     return subprocess.run(cmd, text=True, check=check)
@@ -92,8 +123,11 @@ def check_gh():
         die("gh CLI not authenticated. Run: gh auth login")
 
 
-def poll_run(repo, run_id, label="run", quiet=False):
-    """Poll a workflow run until completion. Returns True on success."""
+def _poll(fetch_fn, label, quiet=False, initial_delay=0):
+    """Poll until completion. fetch_fn() returns (status, conclusion) or None."""
+    if initial_delay:
+        time.sleep(initial_delay)
+
     start = time.monotonic()
     last_status = ""
 
@@ -103,14 +137,12 @@ def poll_run(repo, run_id, label="run", quiet=False):
             err(f"Timed out after {POLL_TIMEOUT}s")
             return False
 
-        data = gh_json("run", "view", str(run_id), "--repo", repo,
-                        "--json", "status,conclusion")
-        if not data:
+        result = fetch_fn()
+        if not result:
             time.sleep(POLL_INTERVAL)
             continue
 
-        status = data["status"]
-        conclusion = data.get("conclusion") or ""
+        status, conclusion = result
 
         if status != last_status and not quiet:
             print(f"  {C.DIM}{label}: {status}{C.RESET}", flush=True)
@@ -127,123 +159,40 @@ def poll_run(repo, run_id, label="run", quiet=False):
         time.sleep(POLL_INTERVAL)
 
 
+
 def poll_workflow(repo, workflow, label="", quiet=False):
     """Poll the most recent run of a workflow until completion."""
-    time.sleep(3)
-    start = time.monotonic()
-
-    while True:
-        elapsed = time.monotonic() - start
-        if elapsed >= POLL_TIMEOUT:
-            err(f"Timed out waiting for {workflow}")
-            return False
-
+    def fetch():
         data = gh_json("run", "list", "--repo", repo,
                         f"--workflow={workflow}", "--limit=1",
                         "--json", "databaseId,status,conclusion")
         if not data:
-            time.sleep(POLL_INTERVAL)
-            continue
-
+            return None
         run = data[0]
-        if run["status"] == "completed":
-            if run["conclusion"] == "success":
-                ok(f"{label or workflow} completed")
-                return True
-            else:
-                err(f"{label or workflow}: {run['conclusion']}")
-                return False
-
-        if not quiet:
-            print(f"  {C.DIM}{label or workflow}: {run['status']}{C.RESET}",
-                  end="\r", flush=True)
-        time.sleep(POLL_INTERVAL)
+        return run["status"], run.get("conclusion") or ""
+    return _poll(fetch, label or workflow, quiet, initial_delay=3)
 
 
 # ── Commands ─────────────────────────────────────────────────────────
 
+def trigger_and_poll(args, workflow, label, force_wait=False):
+    """Trigger a workflow and optionally poll for completion."""
+    info(f"Triggering {label}...")
+    gh("workflow", "run", workflow, "--repo", VMTEST_REPO)
+    ok(f"{workflow} triggered")
+    if force_wait or getattr(args, "wait", False):
+        poll_workflow(VMTEST_REPO, workflow, label, args.quiet)
+
+
 def cmd_sync(args):
     """Sync CI files to vfs base branches."""
-    info("Syncing CI files to base branches...")
-    gh("workflow", "run", "sync.yml", "--repo", VMTEST_REPO)
-    ok("sync.yml triggered")
-
-    if args.wait:
-        poll_workflow(VMTEST_REPO, "sync.yml", "sync", args.quiet)
+    trigger_and_poll(args, "sync.yml", "sync")
 
 
 def cmd_bridge(args):
     """Run the mailing-list-to-PR bridge."""
-    info("Running ml2pr bridge...")
-    gh("workflow", "run", "bridge.yml", "--repo", VMTEST_REPO)
-    ok("bridge.yml triggered")
+    trigger_and_poll(args, "bridge.yml", "bridge")
 
-    if args.wait:
-        poll_workflow(VMTEST_REPO, "bridge.yml", "bridge", args.quiet)
-
-
-def cmd_rerun(args):
-    """Rerun CI for a specific PR or all open PRs."""
-    if args.all:
-        rerun_all_prs(args)
-        return
-
-    if not args.pr:
-        die("Specify --pr NUMBER [NUMBER...] or --all")
-
-    for pr in args.pr:
-        data = gh_json("pr", "view", str(pr), "--repo", VFS_REPO,
-                        "--json", "headRefName")
-        if not data:
-            err(f"PR #{pr} not found")
-            continue
-
-        branch = data["headRefName"]
-        info(f"Rerunning CI for PR #{pr} ({branch})...")
-
-        runs = gh_json("run", "list", "--repo", VFS_REPO,
-                        f"--branch={branch}", "--limit=1",
-                        "--json", "databaseId")
-        if not runs:
-            err(f"No CI run found for PR #{pr}")
-            continue
-
-        run_id = runs[0]["databaseId"]
-        gh("run", "rerun", str(run_id), "--repo", VFS_REPO)
-        ok(f"Rerun triggered for PR #{pr} (run {run_id})")
-
-        if args.wait:
-            poll_run(VFS_REPO, run_id, f"PR #{pr}", args.quiet)
-
-
-def rerun_all_prs(args):
-    """Rerun CI for all open PRs."""
-    prs = gh_json("pr", "list", "--repo", VFS_REPO, "--state=open",
-                   "--limit=200", "--json", "number,headRefName")
-    if not prs:
-        warn("No open PRs")
-        return
-
-    info(f"Rerunning CI for {len(prs)} PR(s)...")
-
-    for i, pr in enumerate(prs, 1):
-        num = pr["number"]
-        branch = pr["headRefName"]
-        print(f"  [{i}/{len(prs)}] PR #{num} ({branch})...", end=" ", flush=True)
-
-        runs = gh_json("run", "list", "--repo", VFS_REPO,
-                        f"--branch={branch}", "--limit=1",
-                        "--json", "databaseId")
-        if not runs:
-            print(f"{C.YELLOW}no run found{C.RESET}")
-            continue
-
-        run_id = runs[0]["databaseId"]
-        gh("run", "rerun", str(run_id), "--repo", VFS_REPO, quiet=True)
-        print(f"{C.GREEN}triggered{C.RESET} (run {run_id})")
-        time.sleep(1)
-
-    ok(f"Rerun triggered for {len(prs)} PR(s)")
 
 
 def delete_pr(num):
@@ -251,7 +200,6 @@ def delete_pr(num):
     data = gh_json("pr", "view", str(num), "--repo", VFS_REPO,
                     "--json", "state,headRefName")
     if not data:
-        err(f"PR #{num} not found")
         return False
 
     branch = data["headRefName"]
@@ -259,12 +207,12 @@ def delete_pr(num):
         warn(f"PR #{num} already {data['state'].lower()}")
     else:
         gh("pr", "close", str(num), "--repo", VFS_REPO,
-           check=False, quiet=True)
+           check=False, capture=True)
 
     if branch.startswith("pw/"):
         gh("api", "-X", "DELETE",
            f"repos/linux-fsdevel/vfs/git/refs/heads/{branch}",
-           check=False, quiet=True)
+           check=False, capture=True)
         ok(f"PR #{num} closed, branch {branch} deleted")
     else:
         ok(f"PR #{num} closed (branch {branch} kept)")
@@ -272,32 +220,82 @@ def delete_pr(num):
     return True
 
 
-def cmd_delete(args):
-    """Close specific PRs and delete their branches."""
-    if args.all:
-        prs = gh_json("pr", "list", "--repo", VFS_REPO, "--state=open",
-                       "--limit=200", "--json", "number")
-        if not prs:
-            warn("No open PRs")
-            return
-
-        info(f"Deleting {len(prs)} open PR(s)...")
-        for i, pr in enumerate(prs, 1):
-            num = pr["number"]
-            print(f"  [{i}/{len(prs)}] ", end="", flush=True)
-            delete_pr(num)
+def delete_orphan_branches():
+    """Delete pw/ branches that have no associated open PR."""
+    info("Deleting orphan pw/ branches...")
+    result = gh("api", "repos/linux-fsdevel/vfs/branches", "--paginate",
+                "--jq", ".[].name", capture=True, check=False)
+    if result.returncode != 0:
+        warn("Failed to list branches")
         return
 
-    if not args.pr:
+    branches = [b.strip() for b in result.stdout.strip().split("\n")
+                if b.strip().startswith("pw/")]
+    if not branches:
+        info("  No pw/ branches")
+        return
+
+    for branch in branches:
+        gh("api", "-X", "DELETE",
+           f"repos/linux-fsdevel/vfs/git/refs/heads/{branch}",
+           check=False, capture=True)
+
+    ok(f"Deleted {len(branches)} branch(es)")
+
+
+def cmd_delete(args):
+    """Close PRs and delete their branches."""
+    if getattr(args, "all", False):
+        prs = gh_json("pr", "list", "--repo", VFS_REPO, "--state=open",
+                       "--limit=200", "--json", "number")
+        if prs:
+            info(f"Deleting {len(prs)} open PR(s)...")
+            for i, pr in enumerate(prs, 1):
+                num = pr["number"]
+                print(f"  [{i}/{len(prs)}] ", end="", flush=True)
+                delete_pr(num)
+        else:
+            info("  No open PRs")
+
+        delete_orphan_branches()
+        return
+
+    if not getattr(args, "pr", None):
         die("Specify --pr NUMBER [NUMBER...] or --all")
 
-    info(f"Deleting {len(args.pr)} PR(s)...")
-    for pr in args.pr:
+    for pr in expand_prs(args.pr):
         delete_pr(pr)
 
 
 def cmd_cancel(args):
-    """Cancel all running/queued workflows."""
+    """Cancel running/queued workflows."""
+    if getattr(args, "pr", None):
+        for pr in expand_prs(args.pr):
+            data = gh_json("pr", "view", str(pr), "--repo", VFS_REPO,
+                            "--json", "headRefName")
+            if not data:
+                continue
+
+            branch = data["headRefName"]
+            runs = gh_json("run", "list", "--repo", VFS_REPO,
+                            f"--branch={branch}", "--limit=20",
+                            "--json", "databaseId,status")
+            if not runs:
+                warn(f"No runs found for PR #{pr}")
+                continue
+
+            active = [r for r in runs if r["status"] != "completed"]
+            if not active:
+                info(f"  No active runs for PR #{pr}")
+                continue
+
+            for run in active:
+                gh("run", "cancel", str(run["databaseId"]),
+                   "--repo", VFS_REPO, check=False, capture=True)
+
+            ok(f"Cancelled {len(active)} run(s) for PR #{pr}")
+        return
+
     repos = [VFS_REPO]
     if args.all:
         repos.append(VMTEST_REPO)
@@ -317,65 +315,20 @@ def cmd_cancel(args):
 
         for run in active:
             gh("run", "cancel", str(run["databaseId"]), "--repo", repo,
-               check=False, quiet=True)
+               check=False, capture=True)
 
         ok(f"Cancelled {len(active)} run(s) on {repo}")
-
-
-def cmd_clean(args):
-    """Close all open PRs and delete all pw/ branches."""
-    info("Closing all open PRs...")
-    prs = gh_json("pr", "list", "--repo", VFS_REPO, "--state=open",
-                   "--limit=200", "--json", "number")
-    if prs:
-        for pr in prs:
-            gh("pr", "close", str(pr["number"]), "--repo", VFS_REPO,
-               check=False, quiet=True)
-        ok(f"Closed {len(prs)} PR(s)")
-    else:
-        info("  No open PRs")
-
-    info("Deleting pw/ branches...")
-    data = gh_json("api", "repos/linux-fsdevel/vfs/branches",
-                    "--paginate", "--jq", ".[].name")
-    # gh_json won't work with --jq producing non-JSON; use raw output
-    result = gh("api", "repos/linux-fsdevel/vfs/branches", "--paginate",
-                "--jq", ".[].name", capture=True, check=False)
-    if result.returncode != 0:
-        warn("Failed to list branches")
-        return
-
-    branches = [b.strip() for b in result.stdout.strip().split("\n")
-                if b.strip().startswith("pw/")]
-    if not branches:
-        info("  No pw/ branches")
-        return
-
-    for branch in branches:
-        gh("api", "-X", "DELETE",
-           f"repos/linux-fsdevel/vfs/git/refs/heads/{branch}",
-           check=False, quiet=True)
-
-    ok(f"Deleted {len(branches)} branch(es)")
 
 
 def cmd_reset(args):
     """Full reset: cancel all, clean branches, sync, bridge."""
     info("Full CI reset...")
-    args.all = True
-    cmd_cancel(args)
-    cmd_clean(args)
-
-    info("Triggering sync...")
-    gh("workflow", "run", "sync.yml", "--repo", VMTEST_REPO)
-    ok("sync.yml triggered")
-    poll_workflow(VMTEST_REPO, "sync.yml", "sync", args.quiet)
-
-    info("Triggering bridge...")
-    gh("workflow", "run", "bridge.yml", "--repo", VMTEST_REPO)
-    ok("bridge.yml triggered")
-    if args.wait:
-        poll_workflow(VMTEST_REPO, "bridge.yml", "bridge", args.quiet)
+    reset_args = argparse.Namespace(all=True, pr=None,
+                                    quiet=args.quiet, wait=args.wait)
+    cmd_cancel(reset_args)
+    cmd_delete(reset_args)
+    trigger_and_poll(args, "sync.yml", "sync", force_wait=True)
+    trigger_and_poll(args, "bridge.yml", "bridge")
 
 
 def cmd_status(args):
@@ -410,18 +363,161 @@ def cmd_status(args):
     info(f"Open PRs: {len(prs) if prs else 0}")
 
 
+def needs_fstests(suite):
+    """Whether the given suite selection requires fstests."""
+    return suite != "selftests"
+
+
+def needs_ovl(suite):
+    """Whether the given suite selection requires unionmount-testsuite."""
+    return suite is None or suite == "ovl-fstests"
+
+
+def run_suite(mkosi_kernel, unit, label):
+    """Run a test suite in QEMU via mkosi. Returns True on success."""
+    info(f"Running {label} in QEMU...")
+    result = subprocess.run(
+        ["mkosi", f"--directory={mkosi_kernel}", "box", "--",
+         "mkosi", f"--directory={mkosi_kernel}",
+         f"--kernel-command-line-extra=systemd.unit={unit}", "qemu"],
+        text=True)
+    if result.returncode != 123:
+        err(f"{label.upper()} FAILED (exit code {result.returncode})")
+        return False
+    ok(f"{label} passed")
+    return True
+
+
+def ensure_repos(base, suite):
+    """Clone mkosi-kernel, fstests, unionmount-testsuite if missing."""
+    mkosi_kernel = base / "mkosi-kernel"
+    fstests = base / "fstests"
+
+    if not mkosi_kernel.is_dir():
+        info(f"Cloning mkosi-kernel to {mkosi_kernel}...")
+        subprocess.run(["git", "clone", "--depth=1",
+                        "https://github.com/DaanDeMeyer/mkosi-kernel.git",
+                        str(mkosi_kernel)], check=True)
+
+    if needs_fstests(suite) and not fstests.is_dir():
+        info(f"Cloning fstests to {fstests}...")
+        subprocess.run(["git", "clone", "--depth=1",
+                        "https://github.com/kdave/xfstests.git",
+                        str(fstests)], check=True)
+
+    unionmount = fstests / "src" / "unionmount-testsuite"
+    if needs_ovl(suite) and not unionmount.is_dir():
+        info(f"Cloning unionmount-testsuite into {fstests}/src/...")
+        subprocess.run(["git", "clone", "--depth=1",
+                        "https://github.com/amir73il/unionmount-testsuite.git",
+                        str(unionmount)], check=True)
+
+    return mkosi_kernel, fstests
+
+
+def configure_mkosi(mkosi_kernel, fstests, kernel_src, suite, distro):
+    """Overlay VFS CI config onto mkosi-kernel and generate mkosi.local.conf."""
+    ci_mkosi = VFS_TEST / "ci" / "mkosi"
+    info("Configuring mkosi...")
+
+    shutil.copy2(ci_mkosi / "mkosi.kernel.config", mkosi_kernel)
+    shutil.copytree(ci_mkosi / "mkosi.extra", mkosi_kernel / "mkosi.extra",
+                    dirs_exist_ok=True)
+    shutil.copytree(ci_mkosi / "mkosi.repart", mkosi_kernel / "mkosi.repart",
+                    dirs_exist_ok=True)
+
+    conf_d = mkosi_kernel / "mkosi.conf.d"
+    conf_d.mkdir(parents=True, exist_ok=True)
+
+    # Strip BuildSources from drop-ins — they reference CI env vars
+    # ($GITHUB_WORKSPACE, $MKOSI_FSTESTS) that don't exist locally.
+    # BuildSources is set in mkosi.local.conf instead; ExtraTrees is
+    # rewritten with the expanded local path.
+    src = (ci_mkosi / "mkosi.conf.d" / "99-vfs.conf").read_text()
+    (conf_d / "99-vfs.conf").write_text(
+        "\n".join(l for l in src.splitlines()
+                  if not l.startswith("BuildSources=")) + "\n")
+
+    if needs_fstests(suite):
+        src = (ci_mkosi / "mkosi.conf.d" / "99-vfs-fstests.conf").read_text()
+        (conf_d / "99-vfs-fstests.conf").write_text(
+            "\n".join(l for l in src.splitlines()
+                      if not l.startswith("BuildSources=")) + "\n")
+
+    if needs_ovl(suite):
+        src = (ci_mkosi / "mkosi.conf.d" / "99-vfs-ovl.conf").read_text()
+        (conf_d / "99-vfs-ovl.conf").write_text(
+            src.replace("$MKOSI_FSTESTS", str(fstests)))
+
+    # Generate mkosi.local.conf
+    buildsources = f"{kernel_src}:kernel"
+    if needs_fstests(suite):
+        buildsources += f"\n            {fstests}:fstests"
+
+    (mkosi_kernel / "mkosi.local.conf").write_text(
+        f"[Distribution]\nDistribution={distro}\n\n"
+        f"[Build]\nBuildSources={buildsources}\n")
+
+
+def cmd_local_test(args):
+    """Run VFS CI mkosi build & tests locally."""
+    kernel_src = Path(args.kernel_src).resolve()
+    if not kernel_src.is_dir():
+        die(f"Kernel source directory not found: {kernel_src}")
+
+    suite = args.suite
+    distro = args.distro
+    base = Path(args.directory)
+
+    mkosi_kernel, fstests = ensure_repos(base, suite)
+
+    # Print configuration
+    info(f"Kernel source:          {kernel_src}")
+    info(f"mkosi-kernel:           {mkosi_kernel}")
+    if needs_fstests(suite):
+        info(f"fstests:                {fstests}")
+    if needs_ovl(suite):
+        info(f"unionmount-testsuite:   {fstests / 'src' / 'unionmount-testsuite'}")
+    info(f"Distribution:           {distro}")
+    info(f"Test suite:             {suite or 'all'}")
+
+    configure_mkosi(mkosi_kernel, fstests, kernel_src, suite, distro)
+
+    # Generate signing keys if not present
+    if not (mkosi_kernel / "mkosi.key").exists():
+        info("Generating signing keys...")
+        subprocess.run(["mkosi", f"--directory={mkosi_kernel}", "genkey"],
+                       check=True)
+
+    # Build
+    info("mkosi summary")
+    subprocess.run(["mkosi", f"--directory={mkosi_kernel}", "summary"],
+                   check=True, env={**os.environ, "PAGER": "cat", "SYSTEMD_PAGER": "cat"})
+
+    info("Building image and kernel...")
+    subprocess.run(["mkosi", f"--directory={mkosi_kernel}", "-f", "build"],
+                   check=True)
+
+    # Run test suites
+    suites = {
+        "selftests":  ("vfs-selftests.service",  "selftests"),
+        "xfstests":   ("xfs-fstests.service",    "xfs fstests"),
+        "ovl-fstests": ("ovl-fstests.service",   "overlayfs fstests"),
+    }
+
+    targets = [suite] if suite else list(suites.keys())
+    for name in targets:
+        unit, label = suites[name]
+        if not run_suite(str(mkosi_kernel), unit, label):
+            sys.exit(1)
+
+    ok("ALL TESTS PASSED")
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
-COMMANDS = {
-    "sync": cmd_sync,
-    "bridge": cmd_bridge,
-    "rerun": cmd_rerun,
-    "delete": cmd_delete,
-    "cancel": cmd_cancel,
-    "clean": cmd_clean,
-    "reset": cmd_reset,
-    "status": cmd_status,
-}
+GH_COMMANDS = {"sync", "bridge", "delete", "cancel",
+               "reset", "status"}
 
 
 def parse_args():
@@ -429,57 +525,89 @@ def parse_args():
         description="Manage CI for linux-fsdevel/vfs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Commands:
-  sync      Sync CI files to vfs base branches
-  bridge    Run the mailing-list-to-PR bridge
-  rerun     Rerun CI for a PR (--pr N) or all PRs (--all)
-  delete    Close PR(s) and delete their pw/ branches
-  cancel    Cancel all active CI runs (--all includes vfs-test)
-  clean     Close all PRs and delete all pw/ branches
-  reset     Full reset: cancel + clean + sync + bridge
-  status    Show current CI status
-
 Examples:
   vfs-ci sync -w               # Sync and wait
   vfs-ci bridge                # Run bridge
-  vfs-ci rerun --pr 235        # Rerun CI for PR #235
-  vfs-ci rerun --pr 235 240    # Rerun CI for multiple PRs
-  vfs-ci rerun --all           # Rerun CI for all open PRs
   vfs-ci delete --pr 235       # Close PR #235 + delete branch
-  vfs-ci delete --pr 235 240   # Close multiple PRs
-  vfs-ci delete --all          # Close all open PRs
+  vfs-ci delete --pr 235-240   # Close PRs #235 through #240
+  vfs-ci delete --all          # Close all PRs + delete pw/ branches
   vfs-ci cancel                # Cancel all vfs CI runs
+  vfs-ci cancel --pr 235       # Cancel runs for PR #235
   vfs-ci cancel --all          # Cancel all runs (both repos)
-  vfs-ci clean                 # Close PRs + delete branches
   vfs-ci reset                 # Full nuclear reset
   vfs-ci reset -w              # Full reset, wait for bridge
   vfs-ci status                # Show CI status
+  vfs-ci local-test -k ~/linux               # Build & run all suites
+  vfs-ci local-test -k ~/linux --suite selftests
+  vfs-ci local-test -k ~/linux -d ~/ci --suite xfstests
 """
     )
 
-    parser.add_argument(
-        "command", choices=list(COMMANDS.keys()),
-        help="Command to run"
-    )
-    parser.add_argument("--pr", type=int, nargs='+',
-                        help="PR number(s) (for rerun/delete)")
-    parser.add_argument("--all", action="store_true",
-                        help="All PRs (rerun) or both repos (cancel)")
-    parser.add_argument("-w", "--wait", action="store_true",
-                        help="Wait for completion")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would be done")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress informational messages")
 
+    sub = parser.add_subparsers(dest="command", required=True,
+                                metavar="COMMAND")
+
+    # ── GitHub CI commands ───────────────────────────────────────
+    p = sub.add_parser("sync", help="Sync CI files to vfs base branches")
+    p.add_argument("-w", "--wait", action="store_true")
+
+    p = sub.add_parser("bridge", help="Run the mailing-list-to-PR bridge")
+    p.add_argument("-w", "--wait", action="store_true")
+
+    p = sub.add_parser("delete", help="Close PR(s) and delete pw/ branches")
+    p.add_argument("--pr", type=parse_pr_range, nargs='+',
+                   metavar="N", help="PR number(s) or range (e.g. 235-240)")
+    p.add_argument("--all", action="store_true",
+                   help="All open PRs + orphan pw/ branches")
+
+    p = sub.add_parser("cancel", help="Cancel active CI runs")
+    p.add_argument("--pr", type=parse_pr_range, nargs='+',
+                   metavar="N", help="PR number(s) or range (e.g. 235-240)")
+    p.add_argument("--all", action="store_true",
+                   help="Include vfs-test repo")
+
+    p = sub.add_parser("reset",
+                       help="Full reset: cancel + delete --all + sync + bridge")
+    p.add_argument("-w", "--wait", action="store_true")
+
+    sub.add_parser("status", help="Show current CI status")
+
+    # ── Local test command ───────────────────────────────────────
+    p = sub.add_parser("local-test",
+                       help="Run VFS CI mkosi build & tests locally")
+    p.add_argument("-k", "--kernel-src", required=True,
+                   help="Kernel source directory")
+    p.add_argument("-d", "--directory", default="/tmp",
+                   help="Base directory for cloned repos "
+                        "(mkosi-kernel, fstests, etc.; default: /tmp)")
+    p.add_argument("--distro", default="fedora",
+                   help="Distribution (default: fedora)")
+    p.add_argument("--suite",
+                   choices=["selftests", "xfstests", "ovl-fstests"],
+                   help="Test suite to run (default: all)")
+
     return parser.parse_args()
+
+
+COMMANDS = {
+    "sync": cmd_sync,
+    "bridge": cmd_bridge,
+
+    "delete": cmd_delete,
+    "cancel": cmd_cancel,
+    "reset": cmd_reset,
+    "status": cmd_status,
+    "local-test": cmd_local_test,
+}
 
 
 def main():
     C.init()
     args = parse_args()
 
-    if not args.dry_run:
+    if args.command in GH_COMMANDS:
         check_gh()
 
     COMMANDS[args.command](args)
