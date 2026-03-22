@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""
+vfs-ci - Manage CI for linux-fsdevel/vfs
+
+Standalone tool for managing the VFS CI infrastructure. Provides
+commands to sync CI files, run the mailing-list-to-PR bridge, rerun
+or cancel CI runs, and clean up branches.
+
+Designed to be self-contained with no external dependencies beyond
+the gh CLI tool.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+
+# ── ANSI colors ──────────────────────────────────────────────────────
+
+class C:
+    BOLD = RESET = RED = GREEN = YELLOW = BLUE = DIM = ""
+
+    @classmethod
+    def init(cls):
+        if sys.stdout.isatty():
+            cls.BOLD = "\033[1m"
+            cls.RESET = "\033[0m"
+            cls.RED = "\033[31m"
+            cls.GREEN = "\033[32m"
+            cls.YELLOW = "\033[33m"
+            cls.BLUE = "\033[34m"
+            cls.DIM = "\033[2m"
+
+
+def info(msg):
+    print(f"{C.BOLD}{msg}{C.RESET}")
+
+def ok(msg):
+    print(f"  {C.GREEN}ok{C.RESET}   {msg}")
+
+def warn(msg):
+    print(f"  {C.YELLOW}warn{C.RESET} {msg}")
+
+def err(msg):
+    print(f"  {C.RED}err{C.RESET}  {msg}")
+
+def die(msg):
+    print(f"{C.RED}fatal:{C.RESET} {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ── Configuration ────────────────────────────────────────────────────
+
+VMTEST_REPO = "linux-fsdevel/vfs-test"
+VFS_REPO = "linux-fsdevel/vfs"
+POLL_INTERVAL = 10
+POLL_TIMEOUT = 600
+
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+def gh(*args, check=True, capture=False, quiet=False):
+    """Run a gh CLI command."""
+    cmd = ["gh"] + list(args)
+    if quiet:
+        return subprocess.run(cmd, capture_output=True, text=True, check=check)
+    if capture:
+        return subprocess.run(cmd, capture_output=True, text=True, check=check)
+    return subprocess.run(cmd, text=True, check=check)
+
+
+def gh_json(*args):
+    """Run a gh CLI command and parse JSON output."""
+    result = gh(*args, capture=True, check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def check_gh():
+    """Verify gh CLI is available and authenticated."""
+    try:
+        subprocess.run(["gh", "auth", "status"],
+                       capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        die("gh CLI not found. Install it: https://cli.github.com/")
+    except subprocess.CalledProcessError:
+        die("gh CLI not authenticated. Run: gh auth login")
+
+
+def poll_run(repo, run_id, label="run", quiet=False):
+    """Poll a workflow run until completion. Returns True on success."""
+    start = time.monotonic()
+    last_status = ""
+
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed >= POLL_TIMEOUT:
+            err(f"Timed out after {POLL_TIMEOUT}s")
+            return False
+
+        data = gh_json("run", "view", str(run_id), "--repo", repo,
+                        "--json", "status,conclusion")
+        if not data:
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        status = data["status"]
+        conclusion = data.get("conclusion") or ""
+
+        if status != last_status and not quiet:
+            print(f"  {C.DIM}{label}: {status}{C.RESET}", flush=True)
+            last_status = status
+
+        if status == "completed":
+            if conclusion == "success":
+                ok(f"{label} completed successfully")
+                return True
+            else:
+                err(f"{label} finished: {conclusion}")
+                return False
+
+        time.sleep(POLL_INTERVAL)
+
+
+def poll_workflow(repo, workflow, label="", quiet=False):
+    """Poll the most recent run of a workflow until completion."""
+    time.sleep(3)
+    start = time.monotonic()
+
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed >= POLL_TIMEOUT:
+            err(f"Timed out waiting for {workflow}")
+            return False
+
+        data = gh_json("run", "list", "--repo", repo,
+                        f"--workflow={workflow}", "--limit=1",
+                        "--json", "databaseId,status,conclusion")
+        if not data:
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        run = data[0]
+        if run["status"] == "completed":
+            if run["conclusion"] == "success":
+                ok(f"{label or workflow} completed")
+                return True
+            else:
+                err(f"{label or workflow}: {run['conclusion']}")
+                return False
+
+        if not quiet:
+            print(f"  {C.DIM}{label or workflow}: {run['status']}{C.RESET}",
+                  end="\r", flush=True)
+        time.sleep(POLL_INTERVAL)
+
+
+# ── Commands ─────────────────────────────────────────────────────────
+
+def cmd_sync(args):
+    """Sync CI files to vfs base branches."""
+    info("Syncing CI files to base branches...")
+    gh("workflow", "run", "sync.yml", "--repo", VMTEST_REPO)
+    ok("sync.yml triggered")
+
+    if args.wait:
+        poll_workflow(VMTEST_REPO, "sync.yml", "sync", args.quiet)
+
+
+def cmd_bridge(args):
+    """Run the mailing-list-to-PR bridge."""
+    info("Running ml2pr bridge...")
+    gh("workflow", "run", "bridge.yml", "--repo", VMTEST_REPO)
+    ok("bridge.yml triggered")
+
+    if args.wait:
+        poll_workflow(VMTEST_REPO, "bridge.yml", "bridge", args.quiet)
+
+
+def cmd_rerun(args):
+    """Rerun CI for a specific PR or all open PRs."""
+    if args.all:
+        rerun_all_prs(args)
+        return
+
+    if not args.pr:
+        die("Specify --pr NUMBER [NUMBER...] or --all")
+
+    for pr in args.pr:
+        data = gh_json("pr", "view", str(pr), "--repo", VFS_REPO,
+                        "--json", "headRefName")
+        if not data:
+            err(f"PR #{pr} not found")
+            continue
+
+        branch = data["headRefName"]
+        info(f"Rerunning CI for PR #{pr} ({branch})...")
+
+        runs = gh_json("run", "list", "--repo", VFS_REPO,
+                        f"--branch={branch}", "--limit=1",
+                        "--json", "databaseId")
+        if not runs:
+            err(f"No CI run found for PR #{pr}")
+            continue
+
+        run_id = runs[0]["databaseId"]
+        gh("run", "rerun", str(run_id), "--repo", VFS_REPO)
+        ok(f"Rerun triggered for PR #{pr} (run {run_id})")
+
+        if args.wait:
+            poll_run(VFS_REPO, run_id, f"PR #{pr}", args.quiet)
+
+
+def rerun_all_prs(args):
+    """Rerun CI for all open PRs."""
+    prs = gh_json("pr", "list", "--repo", VFS_REPO, "--state=open",
+                   "--limit=200", "--json", "number,headRefName")
+    if not prs:
+        warn("No open PRs")
+        return
+
+    info(f"Rerunning CI for {len(prs)} PR(s)...")
+
+    for i, pr in enumerate(prs, 1):
+        num = pr["number"]
+        branch = pr["headRefName"]
+        print(f"  [{i}/{len(prs)}] PR #{num} ({branch})...", end=" ", flush=True)
+
+        runs = gh_json("run", "list", "--repo", VFS_REPO,
+                        f"--branch={branch}", "--limit=1",
+                        "--json", "databaseId")
+        if not runs:
+            print(f"{C.YELLOW}no run found{C.RESET}")
+            continue
+
+        run_id = runs[0]["databaseId"]
+        gh("run", "rerun", str(run_id), "--repo", VFS_REPO, quiet=True)
+        print(f"{C.GREEN}triggered{C.RESET} (run {run_id})")
+        time.sleep(1)
+
+    ok(f"Rerun triggered for {len(prs)} PR(s)")
+
+
+def delete_pr(num):
+    """Close a PR and delete its branch. Returns True on success."""
+    data = gh_json("pr", "view", str(num), "--repo", VFS_REPO,
+                    "--json", "state,headRefName")
+    if not data:
+        err(f"PR #{num} not found")
+        return False
+
+    branch = data["headRefName"]
+    if data["state"] == "CLOSED" or data["state"] == "MERGED":
+        warn(f"PR #{num} already {data['state'].lower()}")
+    else:
+        gh("pr", "close", str(num), "--repo", VFS_REPO,
+           check=False, quiet=True)
+
+    if branch.startswith("pw/"):
+        gh("api", "-X", "DELETE",
+           f"repos/linux-fsdevel/vfs/git/refs/heads/{branch}",
+           check=False, quiet=True)
+        ok(f"PR #{num} closed, branch {branch} deleted")
+    else:
+        ok(f"PR #{num} closed (branch {branch} kept)")
+
+    return True
+
+
+def cmd_delete(args):
+    """Close specific PRs and delete their branches."""
+    if args.all:
+        prs = gh_json("pr", "list", "--repo", VFS_REPO, "--state=open",
+                       "--limit=200", "--json", "number")
+        if not prs:
+            warn("No open PRs")
+            return
+
+        info(f"Deleting {len(prs)} open PR(s)...")
+        for i, pr in enumerate(prs, 1):
+            num = pr["number"]
+            print(f"  [{i}/{len(prs)}] ", end="", flush=True)
+            delete_pr(num)
+        return
+
+    if not args.pr:
+        die("Specify --pr NUMBER [NUMBER...] or --all")
+
+    info(f"Deleting {len(args.pr)} PR(s)...")
+    for pr in args.pr:
+        delete_pr(pr)
+
+
+def cmd_cancel(args):
+    """Cancel all running/queued workflows."""
+    repos = [VFS_REPO]
+    if args.all:
+        repos.append(VMTEST_REPO)
+
+    for repo in repos:
+        info(f"Cancelling active runs on {repo}...")
+        data = gh_json("run", "list", "--repo", repo, "--limit=200",
+                        "--json", "databaseId,status")
+        if not data:
+            info(f"  No runs on {repo}")
+            continue
+
+        active = [r for r in data if r["status"] != "completed"]
+        if not active:
+            info(f"  No active runs on {repo}")
+            continue
+
+        for run in active:
+            gh("run", "cancel", str(run["databaseId"]), "--repo", repo,
+               check=False, quiet=True)
+
+        ok(f"Cancelled {len(active)} run(s) on {repo}")
+
+
+def cmd_clean(args):
+    """Close all open PRs and delete all pw/ branches."""
+    info("Closing all open PRs...")
+    prs = gh_json("pr", "list", "--repo", VFS_REPO, "--state=open",
+                   "--limit=200", "--json", "number")
+    if prs:
+        for pr in prs:
+            gh("pr", "close", str(pr["number"]), "--repo", VFS_REPO,
+               check=False, quiet=True)
+        ok(f"Closed {len(prs)} PR(s)")
+    else:
+        info("  No open PRs")
+
+    info("Deleting pw/ branches...")
+    data = gh_json("api", "repos/linux-fsdevel/vfs/branches",
+                    "--paginate", "--jq", ".[].name")
+    # gh_json won't work with --jq producing non-JSON; use raw output
+    result = gh("api", "repos/linux-fsdevel/vfs/branches", "--paginate",
+                "--jq", ".[].name", capture=True, check=False)
+    if result.returncode != 0:
+        warn("Failed to list branches")
+        return
+
+    branches = [b.strip() for b in result.stdout.strip().split("\n")
+                if b.strip().startswith("pw/")]
+    if not branches:
+        info("  No pw/ branches")
+        return
+
+    for branch in branches:
+        gh("api", "-X", "DELETE",
+           f"repos/linux-fsdevel/vfs/git/refs/heads/{branch}",
+           check=False, quiet=True)
+
+    ok(f"Deleted {len(branches)} branch(es)")
+
+
+def cmd_reset(args):
+    """Full reset: cancel all, clean branches, sync, bridge."""
+    info("Full CI reset...")
+    args.all = True
+    cmd_cancel(args)
+    cmd_clean(args)
+
+    info("Triggering sync...")
+    gh("workflow", "run", "sync.yml", "--repo", VMTEST_REPO)
+    ok("sync.yml triggered")
+    poll_workflow(VMTEST_REPO, "sync.yml", "sync", args.quiet)
+
+    info("Triggering bridge...")
+    gh("workflow", "run", "bridge.yml", "--repo", VMTEST_REPO)
+    ok("bridge.yml triggered")
+    if args.wait:
+        poll_workflow(VMTEST_REPO, "bridge.yml", "bridge", args.quiet)
+
+
+def cmd_status(args):
+    """Show current CI status."""
+    info("Active runs on linux-fsdevel/vfs:")
+    data = gh_json("run", "list", "--repo", VFS_REPO, "--limit=20",
+                    "--json", "databaseId,status,conclusion,headBranch,name")
+    if not data:
+        print("  (none)")
+    else:
+        active = [r for r in data if r["status"] != "completed"]
+        completed = [r for r in data if r["status"] == "completed"][:5]
+
+        if active:
+            for r in active:
+                print(f"  {C.YELLOW}{r['status']:12}{C.RESET} "
+                      f"{r['headBranch']} ({r['databaseId']})")
+        else:
+            print("  No active runs")
+
+        if completed and not args.quiet:
+            print()
+            info("Recent completed:")
+            for r in completed:
+                color = C.GREEN if r["conclusion"] == "success" else C.RED
+                print(f"  {color}{r['conclusion']:12}{C.RESET} "
+                      f"{r['headBranch']} ({r['databaseId']})")
+
+    print()
+    prs = gh_json("pr", "list", "--repo", VFS_REPO, "--state=open",
+                   "--limit=200", "--json", "number")
+    info(f"Open PRs: {len(prs) if prs else 0}")
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+COMMANDS = {
+    "sync": cmd_sync,
+    "bridge": cmd_bridge,
+    "rerun": cmd_rerun,
+    "delete": cmd_delete,
+    "cancel": cmd_cancel,
+    "clean": cmd_clean,
+    "reset": cmd_reset,
+    "status": cmd_status,
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Manage CI for linux-fsdevel/vfs",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  sync      Sync CI files to vfs base branches
+  bridge    Run the mailing-list-to-PR bridge
+  rerun     Rerun CI for a PR (--pr N) or all PRs (--all)
+  delete    Close PR(s) and delete their pw/ branches
+  cancel    Cancel all active CI runs (--all includes vfs-test)
+  clean     Close all PRs and delete all pw/ branches
+  reset     Full reset: cancel + clean + sync + bridge
+  status    Show current CI status
+
+Examples:
+  vfs-ci sync -w               # Sync and wait
+  vfs-ci bridge                # Run bridge
+  vfs-ci rerun --pr 235        # Rerun CI for PR #235
+  vfs-ci rerun --pr 235 240    # Rerun CI for multiple PRs
+  vfs-ci rerun --all           # Rerun CI for all open PRs
+  vfs-ci delete --pr 235       # Close PR #235 + delete branch
+  vfs-ci delete --pr 235 240   # Close multiple PRs
+  vfs-ci delete --all          # Close all open PRs
+  vfs-ci cancel                # Cancel all vfs CI runs
+  vfs-ci cancel --all          # Cancel all runs (both repos)
+  vfs-ci clean                 # Close PRs + delete branches
+  vfs-ci reset                 # Full nuclear reset
+  vfs-ci reset -w              # Full reset, wait for bridge
+  vfs-ci status                # Show CI status
+"""
+    )
+
+    parser.add_argument(
+        "command", choices=list(COMMANDS.keys()),
+        help="Command to run"
+    )
+    parser.add_argument("--pr", type=int, nargs='+',
+                        help="PR number(s) (for rerun/delete)")
+    parser.add_argument("--all", action="store_true",
+                        help="All PRs (rerun) or both repos (cancel)")
+    parser.add_argument("-w", "--wait", action="store_true",
+                        help="Wait for completion")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would be done")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="Suppress informational messages")
+
+    return parser.parse_args()
+
+
+def main():
+    C.init()
+    args = parse_args()
+
+    if not args.dry_run:
+        check_gh()
+
+    COMMANDS[args.command](args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted")
+        sys.exit(130)
