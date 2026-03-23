@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import unquote
 
 # ── ANSI colors ──────────────────────────────────────────────────────
 
@@ -363,6 +364,157 @@ def cmd_status(args):
     info(f"Open PRs: {len(prs) if prs else 0}")
 
 
+def find_pr_by_msgid(msgid):
+    """Find a PR number by searching for a message ID in PR bodies."""
+    # Try GitHub search first
+    query = f'repo:{VFS_REPO} is:pr "{msgid}"'
+    result = gh("api", "search/issues", "--method", "GET",
+                "-f", f"q={query}",
+                "--jq", ".items | sort_by(.number) | reverse | .[0].number",
+                capture=True, check=False)
+
+    pr_num = result.stdout.strip()
+    if pr_num and pr_num != "null":
+        return pr_num
+
+    # Fallback: scan recent open PRs (search index may lag)
+    prs = gh_json("pr", "list", "--repo", VFS_REPO, "--state=all",
+                  "--limit=100", "--json", "number,body")
+    if prs:
+        for pr in prs:
+            if msgid in (pr.get("body") or ""):
+                return str(pr["number"])
+
+    return None
+
+
+def cmd_ci_results(args):
+    """Fetch and display CI results for a lore message ID."""
+    raw = args.msgid.strip()
+
+    # Accept full lore URL — extract the path component containing '@'
+    # Handles /T/, /raw, anchors, and URL-encoded characters
+    if "lore.kernel.org" in raw:
+        parts = raw.rstrip("/").split("/")
+        for part in parts:
+            if "@" in part:
+                raw = unquote(part)
+                break
+
+    msgid = raw.strip("<>")
+
+    if not args.quiet:
+        info(f"Looking up CI for <{msgid}>...")
+
+    pr_num = find_pr_by_msgid(msgid)
+    if not pr_num:
+        die(f"No PR found for message-id: <{msgid}>")
+
+    pr_data = gh_json("pr", "view", pr_num, "--repo", VFS_REPO,
+                      "--json", "number,title,headRefName")
+    if not pr_data:
+        die(f"Failed to fetch PR #{pr_num}")
+
+    if not args.quiet:
+        ok(f"PR #{pr_num}: {pr_data['title']}")
+
+    # Get check runs for the PR
+    # gh pr checks fields: bucket, name, state, link, workflow
+    result = gh("pr", "checks", pr_num, "--repo", VFS_REPO,
+                "--json", "name,state,bucket,link",
+                capture=True, check=False)
+
+    checks = []
+    if result.stdout.strip():
+        try:
+            checks = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            pass
+
+    # Filter to actual test jobs
+    test_checks = [c for c in checks if c.get("name", "") != "set-matrix"]
+
+    if not test_checks:
+        warn("No CI results found (CI may not have run yet)")
+        return
+
+    # Extract run URL from any job link
+    # link format: https://github.com/.../actions/runs/<run_id>/job/<job_id>
+    run_url = None
+    for c in test_checks:
+        link = c.get("link", "")
+        if "/actions/runs/" in link:
+            run_url = link.split("/job/")[0]
+            break
+
+    # Machine-readable output
+    if getattr(args, "json_output", False):
+        def status_str(check):
+            bucket = (check.get("bucket") or "").lower()
+            state = (check.get("state") or "").upper()
+            if bucket in ("pass", "fail", "pending", "skipping"):
+                return bucket
+            if state == "CANCELLED":
+                return "cancelled"
+            return (bucket or state or "unknown").lower()
+
+        out = {
+            "pr": int(pr_num),
+            "title": pr_data["title"],
+            "run_url": run_url,
+            "checks": [
+                {
+                    "name": c["name"].replace(" / build-and-test", ""),
+                    "status": status_str(c),
+                    "link": c.get("link", ""),
+                }
+                for c in sorted(test_checks, key=lambda c: c["name"])
+            ],
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    # Format plain-text output suitable for email
+    def clean_name(name):
+        return name.replace(" / build-and-test", "")
+
+    def get_status(check):
+        bucket = (check.get("bucket") or "").lower()
+        state = (check.get("state") or "").upper()
+        if bucket == "pass":
+            return "pass", C.GREEN
+        elif bucket == "fail":
+            return "FAIL", C.RED
+        elif bucket == "pending":
+            return "running", C.YELLOW
+        elif bucket == "skipping":
+            return "skip", C.DIM
+        elif state == "CANCELLED":
+            return "cancelled", C.YELLOW
+        else:
+            return (bucket or state or "unknown").lower(), C.DIM
+
+    names = [clean_name(c["name"]) for c in test_checks]
+    pad = max(len(n) for n in names)
+
+    print()
+    if run_url:
+        print(f"VFS CI: {run_url}")
+    else:
+        print("VFS CI:")
+    print()
+
+    for c in sorted(test_checks, key=lambda c: c["name"]):
+        name = clean_name(c["name"])
+        status, color = get_status(c)
+        suffix = ""
+        if status == "FAIL" and c.get("link"):
+            suffix = f"\n  {C.DIM}{c['link']}{C.RESET}"
+        print(f"  {name:<{pad}}  {color}{status}{C.RESET}{suffix}")
+
+    print()
+
+
 def needs_fstests(suite):
     """Whether the given suite selection requires fstests."""
     return suite != "selftests"
@@ -517,7 +669,7 @@ def cmd_local_test(args):
 # ── Main ─────────────────────────────────────────────────────────────
 
 GH_COMMANDS = {"sync", "bridge", "delete", "cancel",
-               "reset", "status"}
+               "reset", "status", "ci-results"}
 
 
 def parse_args():
@@ -537,6 +689,8 @@ Examples:
   vfs-ci reset                 # Full nuclear reset
   vfs-ci reset -w              # Full reset, wait for bridge
   vfs-ci status                # Show CI status
+  vfs-ci ci-results '<20250321-foo-v1-0-abc123@kernel.org>'
+  vfs-ci ci-results https://lore.kernel.org/linux-fsdevel/20250321-foo-v1-0-abc123@kernel.org/
   vfs-ci local-test -k ~/linux               # Build & run all suites
   vfs-ci local-test -k ~/linux --suite selftests
   vfs-ci local-test -k ~/linux -d ~/ci --suite xfstests
@@ -574,6 +728,13 @@ Examples:
 
     sub.add_parser("status", help="Show current CI status")
 
+    p = sub.add_parser("ci-results",
+                       help="Show CI results for a lore message ID")
+    p.add_argument("msgid",
+                   help="Message-ID, <Message-ID>, or lore.kernel.org URL")
+    p.add_argument("--json", action="store_true", dest="json_output",
+                   help="Emit machine-readable JSON output")
+
     # ── Local test command ───────────────────────────────────────
     p = sub.add_parser("local-test",
                        help="Run VFS CI mkosi build & tests locally")
@@ -599,6 +760,7 @@ COMMANDS = {
     "cancel": cmd_cancel,
     "reset": cmd_reset,
     "status": cmd_status,
+    "ci-results": cmd_ci_results,
     "local-test": cmd_local_test,
 }
 
