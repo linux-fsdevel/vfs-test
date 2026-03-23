@@ -62,7 +62,7 @@ jobs:
             rm -rf .github ci
             mkdir -p .github/workflows .github/scripts
 
-            cp -r "${GITHUB_WORKSPACE}/ci-source/.github/workflows/"* .github/workflows/
+            cp -r "${GITHUB_WORKSPACE}/ci-source/.github/workflows/ci/"* .github/workflows/
             cp -r "${GITHUB_WORKSPACE}/ci-source/.github/scripts/"* .github/scripts/
             cp -r "${GITHUB_WORKSPACE}/ci-source/ci" ci
 
